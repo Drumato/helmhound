@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,14 +8,14 @@ import (
 	"strings"
 
 	"github.com/Drumato/helmhound/pkg/helmwrap"
-	"github.com/pterm/pterm"
+	"github.com/Drumato/helmhound/pkg/yamldiff"
 	"github.com/spf13/cobra"
 )
 
 func New() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "helmhound",
-		Short: "A Helm analyzer that shows which Helm values affect which resources.",
+		Short: "A Helm chart value selector using fzf.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Initialize logger based on log-level flag
 			logLevel, err := cmd.Flags().GetString("log-level")
@@ -56,33 +55,28 @@ func New() *cobra.Command {
 			if chartUrl == "" {
 				return fmt.Errorf("chart-url is required")
 			}
+			if chartVersion == "" {
+				return fmt.Errorf("chart-version is required")
+			}
 
 			client, err := helmwrap.NewClient()
 			if err != nil {
 				return fmt.Errorf("failed to create helm client: %v", err)
 			}
 
-			spinner, err := pterm.DefaultSpinner.Start("Downloading chart...")
-			if err != nil {
-				return fmt.Errorf("failed to start spinner: %v", err)
-			}
+			slog.Info("Downloading chart...")
 			chartPath, chartName, err := client.DownloadChart(chartUrl, chartVersion)
 			if err != nil {
 				return fmt.Errorf("failed to download chart: %v", err)
 			}
-			spinner.Stop()
 
 			slog.Debug("Chart downloaded", "path", chartPath, "name", chartName)
 
-			spinner, err = pterm.DefaultSpinner.Start("Reading chart values...")
-			if err != nil {
-				return fmt.Errorf("failed to start spinner: %v", err)
-			}
+			slog.Info("Reading chart values...")
 			values, err := client.ReadValuesFromChart(chartPath, chartName)
 			if err != nil {
 				return fmt.Errorf("failed to read chart values: %v", err)
 			}
-			spinner.Stop()
 
 			slog.Debug("Values extracted", "length", len(values))
 
@@ -92,45 +86,10 @@ func New() *cobra.Command {
 			}
 
 			slog.Debug("Value paths extracted", "count", len(valuePaths))
-			if len(valuePaths) > 0 && slog.Default().Enabled(context.TODO(), slog.LevelDebug) {
-				limit := min(len(valuePaths), 10)
-				firstPaths := valuePaths[:limit]
-				slog.Debug("First value paths", "paths", firstPaths)
-			}
 
 			valuePath, err := cmd.Flags().GetString("value-path")
 			if err != nil {
 				return fmt.Errorf("failed to get value-path flag: %v", err)
-			}
-
-			slog.Debug("Searching for value path", "path", valuePath)
-
-			// Log debug information about path search
-			if slog.Default().Enabled(cmd.Context(), slog.LevelDebug) {
-				// Check if the requested path exists
-				found := false
-				for _, path := range valuePaths {
-					if path == valuePath {
-						found = true
-						break
-					}
-				}
-				slog.Debug("Value path existence check", "path", valuePath, "found", found)
-
-				// If looking for prometheus-related paths, show additional info
-				if strings.Contains(valuePath, "prometheus") {
-					prometheusCount := 0
-					var prometheusPaths []string
-					for _, path := range valuePaths {
-						if strings.Contains(path, "prometheus") {
-							prometheusCount++
-							if prometheusCount <= 20 { // Limit to first 20
-								prometheusPaths = append(prometheusPaths, path)
-							}
-						}
-					}
-					slog.Debug("Prometheus-related paths found", "total_count", prometheusCount, "sample_paths", prometheusPaths)
-				}
 			}
 
 			var selectedPath string
@@ -143,31 +102,57 @@ func New() *cobra.Command {
 				}
 			}
 
-			spinner, err = pterm.DefaultSpinner.Start("Reading template files...")
+			// Get the type of the selected value and log it
+			valueType, err := helmwrap.GetValueType(values, selectedPath)
 			if err != nil {
-				return fmt.Errorf("failed to start spinner: %v", err)
-			}
-			templates, err := client.ReadAllTemplateFiles(chartPath, chartName)
-			if err != nil {
-				return fmt.Errorf("failed to read template files: %v", err)
-			}
-			spinner.Stop()
-
-			spinner, err = pterm.DefaultSpinner.Start("Searching for value references...")
-			if err != nil {
-				return fmt.Errorf("failed to start spinner: %v", err)
+				slog.Debug("Failed to get value type", "path", selectedPath, "error", err)
+			} else {
+				slog.Debug("Value type detected", "path", selectedPath, "type", valueTypeToString(valueType))
 			}
 
-			slog.Debug("Template files loaded", "count", len(templates))
-			slog.Debug("Searching for value references", "value", selectedPath)
+			fmt.Printf("Selected value path: %s\n", selectedPath)
 
-			references := helmwrap.SearchValueInTemplates(templates, selectedPath)
-			spinner.Stop()
+			// Render original template
+			slog.Info("Rendering original template...")
+			originalManifest, err := client.RenderTemplate(chartPath, chartName)
+			if err != nil {
+				return fmt.Errorf("failed to render original template: %v", err)
+			}
 
-			slog.Debug("Value references found", "count", len(references))
+			slog.Debug("Original template rendered", "manifest_keys", len(originalManifest))
 
-			output := helmwrap.FormatValueReferences(references)
-			fmt.Printf("\nSearching for value: %s\n\n%s", selectedPath, output)
+			// Render template with modified value
+			slog.Info("Rendering template with modified value...")
+			modifiedManifest, err := client.RenderTemplateWithModifiedValue(chartPath, chartName, selectedPath)
+			if err != nil {
+				return fmt.Errorf("failed to render template with modified value: %v", err)
+			}
+
+			slog.Debug("Modified template rendered", "manifest_keys", len(modifiedManifest))
+
+			// Compare manifests and find differences
+			slog.Info("Comparing manifests...")
+			groupedDiffs := yamldiff.CompareYAMLGroupedDetailed(originalManifest, modifiedManifest)
+
+			if len(groupedDiffs) == 0 {
+				fmt.Println("No differences found in the rendered manifests.")
+				return nil
+			}
+
+			totalPaths := 0
+			for _, items := range groupedDiffs {
+				totalPaths += len(items)
+			}
+
+			fmt.Printf("\nDifferences found (%d paths):\n", totalPaths)
+			for manifestKey, items := range groupedDiffs {
+				fmt.Printf("%s:\n", manifestKey)
+				for _, item := range items {
+					fmt.Printf("  - %s\n", item.DisplayText)
+				}
+				fmt.Println()
+			}
+
 			return nil
 		},
 		SilenceUsage:  true,
@@ -178,6 +163,9 @@ func New() *cobra.Command {
 	c.Flags().String("chart-version", "", "Version of the Helm chart")
 	c.Flags().String("value-path", "", "Specific value path to search for (skips interactive selection)")
 	c.Flags().String("log-level", "info", "Log level (debug, info, warn, error)")
+
+	// Add cache subcommand
+	c.AddCommand(NewCacheCommand())
 
 	return c
 }
@@ -207,4 +195,21 @@ func selectValueWithFzf(values []string) (string, error) {
 	}
 
 	return selected, nil
+}
+
+func valueTypeToString(vt helmwrap.ValueType) string {
+	switch vt {
+	case helmwrap.ValueTypeString:
+		return "string"
+	case helmwrap.ValueTypeInt:
+		return "int"
+	case helmwrap.ValueTypeBool:
+		return "bool"
+	case helmwrap.ValueTypeSlice:
+		return "slice"
+	case helmwrap.ValueTypeMap:
+		return "map"
+	default:
+		return "unknown"
+	}
 }

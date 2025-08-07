@@ -1,12 +1,10 @@
-## Requirements
-
-Please read [requirements.md](./docs/requirements.md).
+anyway, you must read [README.md](./README.md) first.
 
 ## Development Cycle
 
 If you apply any changes to this project, please run `make` to ensure that all changes are properly applied and the project is built correctly.
 
-and, run with `./helmhound.exe --chart-url "oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack" --value-path "prometheus.enabled"`.
+and, run with `./helmhound.exe --chart-url "oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack" --chart-version "75.17.1" --value-path "prometheus.enabled"`.
 
 all exposed function should be documented and tested.
 

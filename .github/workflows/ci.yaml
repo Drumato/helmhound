@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: normal
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: unittest
+      run: make test
+    - name: build
+      run: make build
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v8
+      with:
+        version: v2.1

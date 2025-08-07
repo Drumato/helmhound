@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/registry"
 )
@@ -15,7 +16,8 @@ import (
 type Client interface {
 	DownloadChart(chartUrl, chartVersion string) (string, string, error)
 	ReadValuesFromChart(chartDir, chartName string) (string, error)
-	ReadAllTemplateFiles(chartDir, chartName string) (map[string]string, error)
+	RenderTemplate(chartDir, chartName string) (map[string]interface{}, error)
+	RenderTemplateWithModifiedValue(chartDir, chartName, valuePath string) (map[string]interface{}, error)
 }
 
 type helmClient struct {
@@ -46,15 +48,23 @@ func NewClient() (Client, error) {
 }
 
 func (c *helmClient) DownloadChart(chartUrl, chartVersion string) (string, string, error) {
-	tempDir := os.TempDir()
-	helmhoundDir := filepath.Join(tempDir, "helmhound")
-
-	// Extract chart name from URL for directory naming
-	baseName := extractChartNameFromURL(chartUrl)
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get user home directory: %v", err)
+	}
+	helmhoundDir := filepath.Join(homeDir, ".helmhound")
 
 	if err := os.MkdirAll(helmhoundDir, 0755); err != nil {
 		return "", "", fmt.Errorf("failed to create helmhound directory: %v", err)
 	}
+
+	// Check cache first
+	if entry, exists := checkCacheEntry(helmhoundDir, chartUrl, chartVersion); exists {
+		return entry.DownloadDir, entry.ChartName, nil
+	}
+
+	// Extract chart name from URL for directory naming
+	baseName := extractChartNameFromURL(chartUrl)
 
 	// The chart will be downloaded using the actual chart name from the repository
 	actualChartDir := filepath.Join(helmhoundDir, baseName)
@@ -76,21 +86,27 @@ func (c *helmClient) DownloadChart(chartUrl, chartVersion string) (string, strin
 
 			// Check if versioned directory exists
 			if _, err := os.Stat(finalChartDir); err == nil {
+				// Add to cache and return
+				addCacheEntry(helmhoundDir, chartUrl, existingVersion, finalChartName, helmhoundDir)
 				return helmhoundDir, finalChartName, nil
 			}
 
 			// Rename existing chart to versioned directory
 			if err := os.Rename(actualChartDir, finalChartDir); err == nil {
+				// Add to cache and return
+				addCacheEntry(helmhoundDir, chartUrl, existingVersion, finalChartName, helmhoundDir)
 				return helmhoundDir, finalChartName, nil
 			}
 		}
 
 		// If there's an issue with existing chart, remove it and redownload
-		os.RemoveAll(actualChartDir)
+		if err := os.RemoveAll(actualChartDir); err != nil {
+			return "", "", fmt.Errorf("failed to remove existing chart directory: %v", err)
+		}
 	}
 
 	// Download the chart
-	_, err := pull.Run(chartUrl)
+	_, err = pull.Run(chartUrl)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to pull chart: %v", err)
 	}
@@ -99,7 +115,10 @@ func (c *helmClient) DownloadChart(chartUrl, chartVersion string) (string, strin
 	actualVersion, err := readChartVersion(actualChartDir)
 	if err != nil {
 		// Clean up on error
-		os.RemoveAll(actualChartDir)
+		if removeErr := os.RemoveAll(actualChartDir); removeErr != nil {
+			// Log the cleanup error but return the original error
+			fmt.Fprintf(os.Stderr, "failed to clean up chart directory: %v\n", removeErr)
+		}
 		return "", "", fmt.Errorf("failed to read chart version: %v", err)
 	}
 
@@ -110,15 +129,25 @@ func (c *helmClient) DownloadChart(chartUrl, chartVersion string) (string, strin
 	// Check if the versioned chart already exists
 	if _, err := os.Stat(finalChartDir); err == nil {
 		// Versioned chart already exists, remove the downloaded one and return existing
-		os.RemoveAll(actualChartDir)
+		if err := os.RemoveAll(actualChartDir); err != nil {
+			return "", "", fmt.Errorf("failed to remove duplicate chart directory: %v", err)
+		}
+		// Add to cache and return
+		addCacheEntry(helmhoundDir, chartUrl, actualVersion, finalChartName, helmhoundDir)
 		return helmhoundDir, finalChartName, nil
 	}
 
 	// Rename downloaded directory to final versioned directory
 	if err := os.Rename(actualChartDir, finalChartDir); err != nil {
-		os.RemoveAll(actualChartDir)
+		if removeErr := os.RemoveAll(actualChartDir); removeErr != nil {
+			// Log the cleanup error but return the original error
+			fmt.Fprintf(os.Stderr, "failed to clean up chart directory: %v\n", removeErr)
+		}
 		return "", "", fmt.Errorf("failed to rename chart directory: %v", err)
 	}
+
+	// Add to cache
+	addCacheEntry(helmhoundDir, chartUrl, actualVersion, finalChartName, helmhoundDir)
 
 	return helmhoundDir, finalChartName, nil
 }
@@ -148,13 +177,26 @@ type ChartMetadata struct {
 	Version string `yaml:"version"`
 }
 
+// CacheEntry represents a single cache entry
+type CacheEntry struct {
+	ChartURL    string `yaml:"chart_url"`
+	Version     string `yaml:"version"`
+	ChartName   string `yaml:"chart_name"`
+	DownloadDir string `yaml:"download_dir"`
+}
+
+// CacheFile represents the structure of cache.yaml
+type CacheFile struct {
+	Entries []CacheEntry `yaml:"entries"`
+}
+
 // readChartVersion reads the version from Chart.yaml in the downloaded chart directory
 func readChartVersion(chartDir string) (string, error) {
 	chartYamlPath := filepath.Join(chartDir, "Chart.yaml")
 
 	// Check if Chart.yaml exists
 	if _, err := os.Stat(chartYamlPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("Chart.yaml not found in directory: %s", chartDir)
+		return "", fmt.Errorf("chart.yaml not found in directory: %s", chartDir)
 	}
 
 	// Read Chart.yaml content
@@ -195,50 +237,395 @@ func (c *helmClient) ReadValuesFromChart(chartDir, chartName string) (string, er
 	return string(content), nil
 }
 
-// ReadAllTemplateFiles recursively reads all template files in the chart's templates directory.
-// It returns a map where keys are relative file paths and values are file contents.
-// Only .yaml and .yml files are included in the result.
-// Time complexity: O(n) where n is the number of template files
-// Space complexity: O(m) where m is the total size of all template files
-func (c *helmClient) ReadAllTemplateFiles(chartDir, chartName string) (map[string]string, error) {
-	templatesPath := filepath.Join(chartDir, chartName, "templates")
-
-	// Check if templates directory exists
-	if _, err := os.Stat(templatesPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("templates directory not found: %s", templatesPath)
+// RenderTemplate renders the Helm chart with default values and returns the result as map[string]interface{}
+func (c *helmClient) RenderTemplate(chartDir, chartName string) (map[string]interface{}, error) {
+	// Load chart from the downloaded directory
+	chartPath := filepath.Join(chartDir, chartName)
+	chart, err := loader.Load(chartPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chart: %v", err)
 	}
 
-	templateFiles := make(map[string]string)
+	// Create install action to render templates
+	install := action.NewInstall(c.actionConfig)
+	install.DryRun = true // This makes it only render templates without installing
+	install.ReleaseName = "helmhound-render"
+	install.Namespace = c.settings.Namespace()
+	install.IsUpgrade = false
+	install.ClientOnly = true
+	install.IncludeCRDs = true
+	install.SkipSchemaValidation = true
 
-	err := filepath.Walk(templatesPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	// Remove kubeVersion constraint from chart metadata to avoid compatibility issues
+	originalKubeVersion := chart.Metadata.KubeVersion
+	chart.Metadata.KubeVersion = ""
 
-		// Skip directories and non-template files
-		if info.IsDir() || (!strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml")) {
-			return nil
-		}
+	// Run the install action in dry-run mode to get rendered templates
+	release, err := install.Run(chart, nil) // nil values means use default values from chart
 
-		// Read file content
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("failed to read template file %s: %v", path, err)
-		}
-
-		// Use relative path from templates directory as key
-		relativePath, err := filepath.Rel(templatesPath, path)
-		if err != nil {
-			return fmt.Errorf("failed to get relative path for %s: %v", path, err)
-		}
-
-		templateFiles[relativePath] = string(content)
-		return nil
-	})
+	// Restore original kubeVersion constraint
+	chart.Metadata.KubeVersion = originalKubeVersion
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to walk template directory: %v", err)
+		return nil, fmt.Errorf("failed to render templates: %v", err)
 	}
 
-	return templateFiles, nil
+	// Parse the manifest as multiple YAML documents separated by ---
+	documents := strings.Split(release.Manifest, "---\n")
+	manifestMap := make(map[string]interface{})
+
+	for i, doc := range documents {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+
+		var docData map[string]interface{}
+		if err := yaml.Unmarshal([]byte(doc), &docData); err != nil {
+			// If parsing as map fails, store as raw string
+			manifestMap[fmt.Sprintf("document_%d", i)] = doc
+			continue
+		}
+
+		// Use kind and name as key if available
+		if kind, ok := docData["kind"].(string); ok {
+			key := kind
+			if metadata, ok := docData["metadata"].(map[string]interface{}); ok {
+				if name, ok := metadata["name"].(string); ok {
+					key = fmt.Sprintf("%s_%s", kind, name)
+				}
+			}
+			manifestMap[key] = docData
+		} else {
+			manifestMap[fmt.Sprintf("document_%d", i)] = docData
+		}
+	}
+
+	return manifestMap, nil
+}
+
+// RenderTemplateWithModifiedValue renders the Helm chart with a modified value at the specified path
+func (c *helmClient) RenderTemplateWithModifiedValue(chartDir, chartName, valuePath string) (map[string]interface{}, error) {
+	// Read current values from chart
+	valuesContent, err := c.ReadValuesFromChart(chartDir, chartName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read values from chart: %v", err)
+	}
+
+	// Parse values into map
+	var values map[string]interface{}
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
+		return nil, fmt.Errorf("failed to parse values.yaml: %v", err)
+	}
+
+	// Get the current value type
+	valueType, err := GetValueType(valuesContent, valuePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine value type at path %s: %v", valuePath, err)
+	}
+
+	// Modify the value based on its type
+	modifiedValues, err := modifyValueAtPath(values, valuePath, valueType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to modify value at path %s: %v", valuePath, err)
+	}
+
+	// Load chart from the downloaded directory
+	chartPath := filepath.Join(chartDir, chartName)
+	chart, err := loader.Load(chartPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chart: %v", err)
+	}
+
+	// Create install action to render templates
+	install := action.NewInstall(c.actionConfig)
+	install.DryRun = true // This makes it only render templates without installing
+	install.ReleaseName = "helmhound-render"
+	install.Namespace = c.settings.Namespace()
+	install.IsUpgrade = false
+	install.ClientOnly = true
+	install.IncludeCRDs = true
+	install.SkipSchemaValidation = true
+
+	// Remove kubeVersion constraint from chart metadata to avoid compatibility issues
+	originalKubeVersion := chart.Metadata.KubeVersion
+	chart.Metadata.KubeVersion = ""
+
+	// Run the install action with modified values
+	release, err := install.Run(chart, modifiedValues)
+
+	// Restore original kubeVersion constraint
+	chart.Metadata.KubeVersion = originalKubeVersion
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to render templates: %v", err)
+	}
+
+	// Parse the manifest as multiple YAML documents separated by ---
+	documents := strings.Split(release.Manifest, "---\n")
+	manifestMap := make(map[string]interface{})
+
+	for i, doc := range documents {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+
+		var docData map[string]interface{}
+		if err := yaml.Unmarshal([]byte(doc), &docData); err != nil {
+			// If parsing as map fails, store as raw string
+			manifestMap[fmt.Sprintf("document_%d", i)] = doc
+			continue
+		}
+
+		// Use kind and name as key if available
+		if kind, ok := docData["kind"].(string); ok {
+			key := kind
+			if metadata, ok := docData["metadata"].(map[string]interface{}); ok {
+				if name, ok := metadata["name"].(string); ok {
+					key = fmt.Sprintf("%s_%s", kind, name)
+				}
+			}
+			manifestMap[key] = docData
+		} else {
+			manifestMap[fmt.Sprintf("document_%d", i)] = docData
+		}
+	}
+
+	return manifestMap, nil
+}
+
+// modifyValueAtPath modifies a value at the specified path based on its type
+func modifyValueAtPath(values map[string]interface{}, path string, valueType ValueType) (map[string]interface{}, error) {
+	// Create a deep copy of the values map
+	modifiedValues := make(map[string]interface{})
+	copyMap(values, modifiedValues)
+
+	// Get the current value
+	currentValue, err := getValueAtPath(modifiedValues, path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Modify based on type
+	var newValue interface{}
+	switch valueType {
+	case ValueTypeString:
+		if strVal, ok := currentValue.(string); ok {
+			// Use a more distinctive test value that will definitely cause differences
+			newValue = "helmhound-test-" + strVal
+		} else {
+			return nil, fmt.Errorf("expected string value at path %s", path)
+		}
+	case ValueTypeInt:
+		switch v := currentValue.(type) {
+		case int:
+			newValue = v + 1
+		case int8:
+			newValue = v + 1
+		case int16:
+			newValue = v + 1
+		case int32:
+			newValue = v + 1
+		case int64:
+			newValue = v + 1
+		case uint:
+			newValue = v + 1
+		case uint8:
+			newValue = v + 1
+		case uint16:
+			newValue = v + 1
+		case uint32:
+			newValue = v + 1
+		case uint64:
+			newValue = v + 1
+		case float32:
+			newValue = int(v) + 1
+		case float64:
+			newValue = int(v) + 1
+		default:
+			return nil, fmt.Errorf("expected numeric value at path %s", path)
+		}
+	case ValueTypeBool:
+		if boolVal, ok := currentValue.(bool); ok {
+			newValue = !boolVal
+		} else {
+			return nil, fmt.Errorf("expected boolean value at path %s", path)
+		}
+	case ValueTypeSlice:
+		if sliceVal, ok := currentValue.([]interface{}); ok {
+			// Add a test element to the slice
+			modifiedSlice := make([]interface{}, len(sliceVal))
+			copy(modifiedSlice, sliceVal)
+			modifiedSlice = append(modifiedSlice, "helmhound-test-element")
+			newValue = modifiedSlice
+		} else {
+			return nil, fmt.Errorf("expected slice value at path %s", path)
+		}
+	case ValueTypeMap:
+		if mapVal, ok := currentValue.(map[string]interface{}); ok {
+			// Add a test key-value pair to the map
+			modifiedMap := make(map[string]interface{})
+			copyMap(mapVal, modifiedMap)
+			modifiedMap["helmhound-test-key"] = "helmhound-test-value"
+			newValue = modifiedMap
+		} else {
+			return nil, fmt.Errorf("expected map value at path %s", path)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported value type for modification: %v", valueType)
+	}
+
+	// Set the new value at the specified path
+	err = setValueAtPath(modifiedValues, path, newValue)
+	if err != nil {
+		return nil, err
+	}
+
+	return modifiedValues, nil
+}
+
+// copyMap creates a deep copy of a map[string]interface{}
+func copyMap(src, dst map[string]interface{}) {
+	for key, value := range src {
+		switch v := value.(type) {
+		case map[string]interface{}:
+			nested := make(map[string]interface{})
+			copyMap(v, nested)
+			dst[key] = nested
+		case []interface{}:
+			dst[key] = copySlice(v)
+		default:
+			dst[key] = v
+		}
+	}
+}
+
+// copySlice creates a deep copy of a []interface{}
+func copySlice(src []interface{}) []interface{} {
+	dst := make([]interface{}, len(src))
+	for i, item := range src {
+		switch v := item.(type) {
+		case map[string]interface{}:
+			nested := make(map[string]interface{})
+			copyMap(v, nested)
+			dst[i] = nested
+		case []interface{}:
+			dst[i] = copySlice(v)
+		default:
+			dst[i] = v
+		}
+	}
+	return dst
+}
+
+// setValueAtPath sets a value at the specified path in the map
+func setValueAtPath(data map[string]interface{}, path string, value interface{}) error {
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+
+	keys := splitPath(path)
+	current := data
+
+	// Navigate to the parent of the target key
+	for i := 0; i < len(keys)-1; i++ {
+		key := keys[i]
+		if next, ok := current[key]; ok {
+			if nextMap, ok := next.(map[string]interface{}); ok {
+				current = nextMap
+			} else {
+				return fmt.Errorf("cannot navigate through non-map value at key '%s'", key)
+			}
+		} else {
+			// Create missing intermediate maps
+			newMap := make(map[string]interface{})
+			current[key] = newMap
+			current = newMap
+		}
+	}
+
+	// Set the final value
+	finalKey := keys[len(keys)-1]
+	current[finalKey] = value
+
+	return nil
+}
+
+// checkCacheEntry checks if a chart with given URL and version exists in cache
+func checkCacheEntry(helmhoundDir, chartUrl, chartVersion string) (CacheEntry, bool) {
+	cacheFile := loadCacheFile(helmhoundDir)
+
+	for _, entry := range cacheFile.Entries {
+		if entry.ChartURL == chartUrl && entry.Version == chartVersion {
+			// Verify that the cached directory still exists
+			chartPath := filepath.Join(entry.DownloadDir, entry.ChartName)
+			if _, err := os.Stat(chartPath); err == nil {
+				return entry, true
+			}
+		}
+	}
+
+	return CacheEntry{}, false
+}
+
+// addCacheEntry adds a new entry to the cache file
+func addCacheEntry(helmhoundDir, chartUrl, version, chartName, downloadDir string) {
+	cacheFile := loadCacheFile(helmhoundDir)
+
+	// Check if entry already exists (avoid duplicates)
+	for _, entry := range cacheFile.Entries {
+		if entry.ChartURL == chartUrl && entry.Version == version {
+			return // Already exists
+		}
+	}
+
+	// Add new entry
+	newEntry := CacheEntry{
+		ChartURL:    chartUrl,
+		Version:     version,
+		ChartName:   chartName,
+		DownloadDir: downloadDir,
+	}
+
+	cacheFile.Entries = append(cacheFile.Entries, newEntry)
+	saveCacheFile(helmhoundDir, cacheFile)
+}
+
+// loadCacheFile loads the cache file or returns empty cache if file doesn't exist
+func loadCacheFile(helmhoundDir string) CacheFile {
+	cacheFilePath := filepath.Join(helmhoundDir, "cache.yaml")
+
+	// If cache file doesn't exist, return empty cache
+	if _, err := os.Stat(cacheFilePath); os.IsNotExist(err) {
+		return CacheFile{Entries: []CacheEntry{}}
+	}
+
+	// Read and parse cache file
+	content, err := os.ReadFile(cacheFilePath)
+	if err != nil {
+		return CacheFile{Entries: []CacheEntry{}}
+	}
+
+	var cacheFile CacheFile
+	if err := yaml.Unmarshal(content, &cacheFile); err != nil {
+		return CacheFile{Entries: []CacheEntry{}}
+	}
+
+	return cacheFile
+}
+
+// saveCacheFile saves the cache file to disk
+func saveCacheFile(helmhoundDir string, cacheFile CacheFile) {
+	cacheFilePath := filepath.Join(helmhoundDir, "cache.yaml")
+
+	content, err := yaml.Marshal(cacheFile)
+	if err != nil {
+		return // Silent failure for now
+	}
+
+	if err := os.WriteFile(cacheFilePath, content, 0644); err != nil {
+		// Log the error but don't fail the operation
+		fmt.Fprintf(os.Stderr, "failed to write cache file: %v\n", err)
+	}
 }

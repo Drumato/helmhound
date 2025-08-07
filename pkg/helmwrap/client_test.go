@@ -1,147 +1,138 @@
 package helmwrap
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
-	"sort"
 	"testing"
 )
 
-func TestHelmClient_ReadAllTemplateFiles(t *testing.T) {
+func TestModifyValueAtPath(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name          string
-		setupFunc     func(t *testing.T) (string, string, func())
-		wantFiles     map[string]string
-		wantErr       bool
-		wantErrString string
+		name        string
+		values      map[string]interface{}
+		path        string
+		valueType   ValueType
+		expected    interface{}
+		expectError bool
 	}{
 		{
-			name: "should read all template files successfully",
-			setupFunc: func(t *testing.T) (string, string, func()) {
-				tempDir := t.TempDir()
-				chartName := "test-chart"
-				chartDir := filepath.Join(tempDir, chartName)
-				templatesDir := filepath.Join(chartDir, "templates")
-
-				if err := os.MkdirAll(templatesDir, 0755); err != nil {
-					t.Fatalf("failed to create templates directory: %v", err)
-				}
-
-				// Create test template files
-				deploymentContent := `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ .Values.name }}
-spec:
-  replicas: {{ .Values.replicaCount }}`
-
-				serviceContent := `apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Values.name }}-service
-spec:
-  type: {{ .Values.service.type }}`
-
-				if err := os.WriteFile(filepath.Join(templatesDir, "deployment.yaml"), []byte(deploymentContent), 0644); err != nil {
-					t.Fatalf("failed to write deployment.yaml: %v", err)
-				}
-
-				if err := os.WriteFile(filepath.Join(templatesDir, "service.yml"), []byte(serviceContent), 0644); err != nil {
-					t.Fatalf("failed to write service.yml: %v", err)
-				}
-
-				// Create a non-template file (should be ignored)
-				if err := os.WriteFile(filepath.Join(templatesDir, "README.md"), []byte("# Chart Templates"), 0644); err != nil {
-					t.Fatalf("failed to write README.md: %v", err)
-				}
-
-				return tempDir, chartName, func() {}
+			name: "modify string value",
+			values: map[string]interface{}{
+				"test": "hello",
 			},
-			wantFiles: map[string]string{
-				"deployment.yaml": `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ .Values.name }}
-spec:
-  replicas: {{ .Values.replicaCount }}`,
-				"service.yml": `apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Values.name }}-service
-spec:
-  type: {{ .Values.service.type }}`,
-			},
-			wantErr: false,
+			path:      "test",
+			valueType: ValueTypeString,
+			expected:  "helmhound-test-hello",
 		},
 		{
-			name: "should read nested template files",
-			setupFunc: func(t *testing.T) (string, string, func()) {
-				tempDir := t.TempDir()
-				chartName := "nested-chart"
-				chartDir := filepath.Join(tempDir, chartName)
-				templatesDir := filepath.Join(chartDir, "templates")
-				nestedDir := filepath.Join(templatesDir, "nested")
-
-				if err := os.MkdirAll(nestedDir, 0755); err != nil {
-					t.Fatalf("failed to create nested directory: %v", err)
-				}
-
-				configContent := `apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: config
-data:
-  key: {{ .Values.config.key }}`
-
-				if err := os.WriteFile(filepath.Join(nestedDir, "configmap.yaml"), []byte(configContent), 0644); err != nil {
-					t.Fatalf("failed to write nested configmap.yaml: %v", err)
-				}
-
-				return tempDir, chartName, func() {}
+			name: "modify int value",
+			values: map[string]interface{}{
+				"count": 42,
 			},
-			wantFiles: map[string]string{
-				"nested/configmap.yaml": `apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: config
-data:
-  key: {{ .Values.config.key }}`,
-			},
-			wantErr: false,
+			path:      "count",
+			valueType: ValueTypeInt,
+			expected:  43,
 		},
 		{
-			name: "should return error when templates directory does not exist",
-			setupFunc: func(t *testing.T) (string, string, func()) {
-				tempDir := t.TempDir()
-				chartName := "no-templates-chart"
-				// Don't create templates directory
-
-				return tempDir, chartName, func() {}
+			name: "modify bool value",
+			values: map[string]interface{}{
+				"enabled": true,
 			},
-			wantFiles:     nil,
-			wantErr:       true,
-			wantErrString: "templates directory not found",
+			path:      "enabled",
+			valueType: ValueTypeBool,
+			expected:  false,
 		},
 		{
-			name: "should handle empty templates directory",
-			setupFunc: func(t *testing.T) (string, string, func()) {
-				tempDir := t.TempDir()
-				chartName := "empty-chart"
-				chartDir := filepath.Join(tempDir, chartName)
-				templatesDir := filepath.Join(chartDir, "templates")
-
-				if err := os.MkdirAll(templatesDir, 0755); err != nil {
-					t.Fatalf("failed to create empty templates directory: %v", err)
-				}
-
-				return tempDir, chartName, func() {}
+			name: "modify nested string value",
+			values: map[string]interface{}{
+				"config": map[string]interface{}{
+					"database": map[string]interface{}{
+						"host": "localhost",
+					},
+				},
 			},
-			wantFiles: map[string]string{},
-			wantErr:   false,
+			path:      "config.database.host",
+			valueType: ValueTypeString,
+			expected:  "helmhound-test-localhost",
+		},
+		{
+			name: "modify nested int value",
+			values: map[string]interface{}{
+				"server": map[string]interface{}{
+					"port": 8080,
+				},
+			},
+			path:      "server.port",
+			valueType: ValueTypeInt,
+			expected:  8081,
+		},
+		{
+			name: "modify nested bool value",
+			values: map[string]interface{}{
+				"features": map[string]interface{}{
+					"auth": map[string]interface{}{
+						"enabled": false,
+					},
+				},
+			},
+			path:      "features.auth.enabled",
+			valueType: ValueTypeBool,
+			expected:  true,
+		},
+		{
+			name: "modify slice value",
+			values: map[string]interface{}{
+				"tags": []interface{}{"tag1", "tag2"},
+			},
+			path:      "tags",
+			valueType: ValueTypeSlice,
+			expected:  []interface{}{"tag1", "tag2", "helmhound-test-element"},
+		},
+		{
+			name: "modify nested slice value",
+			values: map[string]interface{}{
+				"config": map[string]interface{}{
+					"environments": []interface{}{"dev", "prod"},
+				},
+			},
+			path:      "config.environments",
+			valueType: ValueTypeSlice,
+			expected:  []interface{}{"dev", "prod", "helmhound-test-element"},
+		},
+		{
+			name: "modify map value",
+			values: map[string]interface{}{
+				"settings": map[string]interface{}{
+					"debug":   true,
+					"timeout": 30,
+				},
+			},
+			path:      "settings",
+			valueType: ValueTypeMap,
+			expected: map[string]interface{}{
+				"debug":              true,
+				"timeout":            30,
+				"helmhound-test-key": "helmhound-test-value",
+			},
+		},
+		{
+			name: "modify nested map value",
+			values: map[string]interface{}{
+				"database": map[string]interface{}{
+					"postgres": map[string]interface{}{
+						"host": "localhost",
+						"port": 5432,
+					},
+				},
+			},
+			path:      "database.postgres",
+			valueType: ValueTypeMap,
+			expected: map[string]interface{}{
+				"host":               "localhost",
+				"port":               5432,
+				"helmhound-test-key": "helmhound-test-value",
+			},
 		},
 	}
 
@@ -149,178 +140,152 @@ data:
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			chartDir, chartName, cleanup := tt.setupFunc(t)
-			defer cleanup()
+			result, err := modifyValueAtPath(tt.values, tt.path, tt.valueType)
 
-			client := &helmClient{}
-			got, err := client.ReadAllTemplateFiles(chartDir, chartName)
-
-			if tt.wantErr {
+			if tt.expectError {
 				if err == nil {
-					t.Errorf("ReadAllTemplateFiles() error = nil, wantErr %v", tt.wantErr)
-					return
-				}
-				if tt.wantErrString != "" && !containsString(err.Error(), tt.wantErrString) {
-					t.Errorf("ReadAllTemplateFiles() error = %v, wantErrString %v", err, tt.wantErrString)
+					t.Errorf("expected error but got none")
 				}
 				return
 			}
 
 			if err != nil {
-				t.Errorf("ReadAllTemplateFiles() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("unexpected error: %v", err)
 				return
 			}
 
-			if !reflect.DeepEqual(got, tt.wantFiles) {
-				t.Errorf("ReadAllTemplateFiles() = %v, want %v", got, tt.wantFiles)
+			// Get the modified value
+			actual, err := getValueAtPath(result, tt.path)
+			if err != nil {
+				t.Errorf("failed to get value at path %s: %v", tt.path, err)
+				return
+			}
+
+			if !reflect.DeepEqual(actual, tt.expected) {
+				t.Errorf("expected %v, got %v", tt.expected, actual)
 			}
 		})
 	}
 }
 
-func TestHelmClient_ReadAllTemplateFiles_Integration(t *testing.T) {
+func TestCopyMap(t *testing.T) {
 	t.Parallel()
 
-	// Create a realistic test chart structure
-	tempDir := t.TempDir()
-	chartName := "integration-chart"
-	chartDir := filepath.Join(tempDir, chartName)
-	templatesDir := filepath.Join(chartDir, "templates")
-
-	if err := os.MkdirAll(templatesDir, 0755); err != nil {
-		t.Fatalf("failed to create templates directory: %v", err)
+	original := map[string]interface{}{
+		"simple": "value",
+		"nested": map[string]interface{}{
+			"key": "nested_value",
+		},
+		"slice": []interface{}{1, 2, 3},
 	}
 
-	// Create multiple template files with realistic content
-	templates := map[string]string{
-		"deployment.yaml": `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ include "chart.fullname" . }}
-  labels:
-    {{- include "chart.labels" . | nindent 4 }}
-spec:
-  replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      {{- include "chart.selectorLabels" . | nindent 6 }}
-  template:
-    metadata:
-      labels:
-        {{- include "chart.selectorLabels" . | nindent 8 }}
-    spec:
-      containers:
-      - name: {{ .Chart.Name }}
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-        ports:
-        - name: http
-          containerPort: {{ .Values.service.port }}`,
-		"service.yaml": `apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "chart.fullname" . }}
-  labels:
-    {{- include "chart.labels" . | nindent 4 }}
-spec:
-  type: {{ .Values.service.type }}
-  ports:
-  - port: {{ .Values.service.port }}
-    targetPort: http
-    protocol: TCP
-    name: http
-  selector:
-    {{- include "chart.selectorLabels" . | nindent 4 }}`,
-		"helpers/_helpers.tpl": `{{- define "chart.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
-{{- end }}`,
+	copied := make(map[string]interface{})
+	copyMap(original, copied)
+
+	// Modify the original
+	original["simple"] = "modified"
+	if nestedMap, ok := original["nested"].(map[string]interface{}); ok {
+		nestedMap["key"] = "modified_nested"
+	}
+	if slice, ok := original["slice"].([]interface{}); ok {
+		slice[0] = 999
 	}
 
-	for fileName, content := range templates {
-		filePath := filepath.Join(templatesDir, fileName)
-		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-			t.Fatalf("failed to create directory for %s: %v", fileName, err)
+	// Check that copied values are not affected
+	if copied["simple"] != "value" {
+		t.Errorf("expected 'value', got %v", copied["simple"])
+	}
+
+	if nestedMap, ok := copied["nested"].(map[string]interface{}); ok {
+		if nestedMap["key"] != "nested_value" {
+			t.Errorf("expected 'nested_value', got %v", nestedMap["key"])
 		}
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-			t.Fatalf("failed to write %s: %v", fileName, err)
+	} else {
+		t.Error("nested map not found in copied data")
+	}
+
+	if slice, ok := copied["slice"].([]interface{}); ok {
+		if slice[0] != 1 {
+			t.Errorf("expected 1, got %v", slice[0])
 		}
-	}
-
-	client := &helmClient{}
-	got, err := client.ReadAllTemplateFiles(tempDir, chartName)
-	if err != nil {
-		t.Fatalf("ReadAllTemplateFiles() error = %v", err)
-	}
-
-	// Verify we got all expected files (except .tpl files which should be ignored)
-	expectedFiles := []string{"deployment.yaml", "service.yaml"}
-	var gotFiles []string
-	for fileName := range got {
-		gotFiles = append(gotFiles, fileName)
-	}
-	sort.Strings(gotFiles)
-	sort.Strings(expectedFiles)
-
-	if !reflect.DeepEqual(gotFiles, expectedFiles) {
-		t.Errorf("ReadAllTemplateFiles() files = %v, want %v", gotFiles, expectedFiles)
-	}
-
-	// Verify content of one file
-	if deploymentContent, exists := got["deployment.yaml"]; !exists {
-		t.Error("deployment.yaml not found in results")
-	} else if !containsString(deploymentContent, ".Values.replicaCount") {
-		t.Error("deployment.yaml content doesn't contain expected value reference")
+	} else {
+		t.Error("slice not found in copied data")
 	}
 }
 
-func BenchmarkHelmClient_ReadAllTemplateFiles(b *testing.B) {
-	// Setup test data
-	tempDir := b.TempDir()
-	chartName := "benchmark-chart"
-	chartDir := filepath.Join(tempDir, chartName)
-	templatesDir := filepath.Join(chartDir, "templates")
+func TestSetValueAtPath(t *testing.T) {
+	t.Parallel()
 
-	if err := os.MkdirAll(templatesDir, 0755); err != nil {
-		b.Fatalf("failed to create templates directory: %v", err)
+	tests := []struct {
+		name        string
+		data        map[string]interface{}
+		path        string
+		value       interface{}
+		expectError bool
+	}{
+		{
+			name: "set simple value",
+			data: map[string]interface{}{
+				"test": "old",
+			},
+			path:  "test",
+			value: "new",
+		},
+		{
+			name: "set nested value",
+			data: map[string]interface{}{
+				"config": map[string]interface{}{
+					"database": map[string]interface{}{
+						"host": "old_host",
+					},
+				},
+			},
+			path:  "config.database.host",
+			value: "new_host",
+		},
+		{
+			name:  "create missing path",
+			data:  map[string]interface{}{},
+			path:  "new.nested.key",
+			value: "value",
+		},
+		{
+			name:        "empty path",
+			data:        map[string]interface{}{},
+			path:        "",
+			value:       "value",
+			expectError: true,
+		},
 	}
 
-	// Create many template files
-	for i := 0; i < 50; i++ {
-		content := generateLargeTemplate("resource", 100)
-		fileName := filepath.Join(templatesDir, fmt.Sprintf("template%d.yaml", i))
-		if err := os.WriteFile(fileName, []byte(content), 0644); err != nil {
-			b.Fatalf("failed to write template file: %v", err)
-		}
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	client := &helmClient{}
+			err := setValueAtPath(tt.data, tt.path, tt.value)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := client.ReadAllTemplateFiles(tempDir, chartName)
-		if err != nil {
-			b.Fatalf("ReadAllTemplateFiles() error = %v", err)
-		}
-	}
-}
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("expected error but got none")
+				}
+				return
+			}
 
-// Helper function to check if a string contains a substring
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			len(s) > len(substr)+1 && containsSubstring(s[1:len(s)-1], substr)))
-}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
 
-func containsSubstring(s, substr string) bool {
-	if len(substr) == 0 {
-		return true
+			// Verify the value was set correctly
+			actual, err := getValueAtPath(tt.data, tt.path)
+			if err != nil {
+				t.Errorf("failed to get value at path %s: %v", tt.path, err)
+				return
+			}
+
+			if actual != tt.value {
+				t.Errorf("expected %v, got %v", tt.value, actual)
+			}
+		})
 	}
-	if len(s) < len(substr) {
-		return false
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
