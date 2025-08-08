@@ -22,7 +22,14 @@ helmhoundは、Helmチャートの値（values）を対話的に選択し、そ�
 - Go 1.24.5以上
 - [fzf](https://github.com/junegunn/fzf) - fuzzyfinder
 
-### ビルド
+### Via Homebrew
+
+```bash
+brew tap Drumato/formulas
+brew install helmhound
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/Drumato/helmhound

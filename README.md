@@ -22,7 +22,14 @@ helmhound is a CLI tool for interactively selecting Helm chart values and visual
 - Go 1.24.5 or higher
 - [fzf](https://github.com/junegunn/fzf) - fuzzyfinder
 
-### Build
+### Via Homebrew
+
+```bash
+brew tap Drumato/formulas
+brew install helmhound
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/Drumato/helmhound
