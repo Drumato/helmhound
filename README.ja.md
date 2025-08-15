@@ -1,3 +1,5 @@
+![helmhound.png](./helmhound.png)
+
 # helmhound
 
 [English](./README.md)
