@@ -51,6 +51,14 @@ make
 ./helmhound.exe --chart-url "oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack" --chart-version "75.17.1" --value-path "prometheus.enabled"
 ```
 
+### required valueを持つチャートへの対応
+
+対象のHelm Chartがrequired valueを使っており、デフォルトのvaluesだとレンダリングエラーを起こす際は、`--values-file`を使ってoverrideしてください：
+
+```bash
+./helmhound.exe --chart-url "oci://example.com/chart-with-required-values" --chart-version "1.0.0" --values-file "custom-values.yaml"
+```
+
 ### ログレベルを指定
 
 ```bash

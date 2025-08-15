@@ -16,8 +16,8 @@ import (
 type Client interface {
 	DownloadChart(chartUrl, chartVersion string) (string, string, error)
 	ReadValuesFromChart(chartDir, chartName string) (string, error)
-	RenderTemplate(chartDir, chartName string) (map[string]interface{}, error)
-	RenderTemplateWithModifiedValue(chartDir, chartName, valuePath string) (map[string]interface{}, error)
+	RenderTemplate(chartDir, chartName, valuesFile string) (map[string]interface{}, error)
+	RenderTemplateWithModifiedValue(chartDir, chartName, valuePath, valuesFile string) (map[string]interface{}, error)
 }
 
 type helmClient struct {
@@ -237,8 +237,68 @@ func (c *helmClient) ReadValuesFromChart(chartDir, chartName string) (string, er
 	return string(content), nil
 }
 
-// RenderTemplate renders the Helm chart with default values and returns the result as map[string]interface{}
-func (c *helmClient) RenderTemplate(chartDir, chartName string) (map[string]interface{}, error) {
+// mergeValues merges user-provided values file with chart default values
+func (c *helmClient) mergeValues(chartDir, chartName, valuesFile string) (map[string]interface{}, error) {
+	// Start with chart default values
+	defaultValuesContent, err := c.ReadValuesFromChart(chartDir, chartName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read default values: %v", err)
+	}
+
+	var defaultValues map[string]interface{}
+	if err := yaml.Unmarshal([]byte(defaultValuesContent), &defaultValues); err != nil {
+		return nil, fmt.Errorf("failed to parse default values: %v", err)
+	}
+
+	// If no custom values file provided, return default values
+	if valuesFile == "" {
+		return defaultValues, nil
+	}
+
+	// Read custom values file
+	customContent, err := os.ReadFile(valuesFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read custom values file %s: %v", valuesFile, err)
+	}
+
+	var customValues map[string]interface{}
+	if err := yaml.Unmarshal(customContent, &customValues); err != nil {
+		return nil, fmt.Errorf("failed to parse custom values file: %v", err)
+	}
+
+	// Merge custom values into default values (custom values override defaults)
+	mergedValues := make(map[string]interface{})
+	copyMap(defaultValues, mergedValues)
+	deepMergeMap(mergedValues, customValues)
+
+	return mergedValues, nil
+}
+
+// deepMergeMap merges source map into destination map recursively
+func deepMergeMap(dst, src map[string]interface{}) {
+	for key, srcValue := range src {
+		if dstValue, exists := dst[key]; exists {
+			// If both values are maps, merge them recursively
+			if dstMap, dstIsMap := dstValue.(map[string]interface{}); dstIsMap {
+				if srcMap, srcIsMap := srcValue.(map[string]interface{}); srcIsMap {
+					deepMergeMap(dstMap, srcMap)
+					continue
+				}
+			}
+		}
+		// For all other cases, override with source value
+		dst[key] = srcValue
+	}
+}
+
+// RenderTemplate renders the Helm chart with merged values and returns the result as map[string]interface{}
+func (c *helmClient) RenderTemplate(chartDir, chartName, valuesFile string) (map[string]interface{}, error) {
+	// Get merged values
+	mergedValues, err := c.mergeValues(chartDir, chartName, valuesFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge values: %v", err)
+	}
+
 	// Load chart from the downloaded directory
 	chartPath := filepath.Join(chartDir, chartName)
 	chart, err := loader.Load(chartPath)
@@ -261,7 +321,7 @@ func (c *helmClient) RenderTemplate(chartDir, chartName string) (map[string]inte
 	chart.Metadata.KubeVersion = ""
 
 	// Run the install action in dry-run mode to get rendered templates
-	release, err := install.Run(chart, nil) // nil values means use default values from chart
+	release, err := install.Run(chart, mergedValues) // Use merged values
 
 	// Restore original kubeVersion constraint
 	chart.Metadata.KubeVersion = originalKubeVersion
@@ -305,27 +365,27 @@ func (c *helmClient) RenderTemplate(chartDir, chartName string) (map[string]inte
 }
 
 // RenderTemplateWithModifiedValue renders the Helm chart with a modified value at the specified path
-func (c *helmClient) RenderTemplateWithModifiedValue(chartDir, chartName, valuePath string) (map[string]interface{}, error) {
-	// Read current values from chart
-	valuesContent, err := c.ReadValuesFromChart(chartDir, chartName)
+func (c *helmClient) RenderTemplateWithModifiedValue(chartDir, chartName, valuePath, valuesFile string) (map[string]interface{}, error) {
+	// Get merged values
+	mergedValues, err := c.mergeValues(chartDir, chartName, valuesFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read values from chart: %v", err)
+		return nil, fmt.Errorf("failed to merge values: %v", err)
 	}
 
-	// Parse values into map
-	var values map[string]interface{}
-	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
-		return nil, fmt.Errorf("failed to parse values.yaml: %v", err)
+	// Convert merged values to YAML for GetValueType function
+	mergedValuesYAML, err := yaml.Marshal(mergedValues)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal merged values: %v", err)
 	}
 
-	// Get the current value type
-	valueType, err := GetValueType(valuesContent, valuePath)
+	// Get the current value type from merged values
+	valueType, err := GetValueType(string(mergedValuesYAML), valuePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine value type at path %s: %v", valuePath, err)
 	}
 
 	// Modify the value based on its type
-	modifiedValues, err := modifyValueAtPath(values, valuePath, valueType)
+	modifiedValues, err := modifyValueAtPath(mergedValues, valuePath, valueType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to modify value at path %s: %v", valuePath, err)
 	}

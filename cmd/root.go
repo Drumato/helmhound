@@ -92,6 +92,11 @@ func New() *cobra.Command {
 				return fmt.Errorf("failed to get value-path flag: %v", err)
 			}
 
+			valuesFile, err := cmd.Flags().GetString("values-file")
+			if err != nil {
+				return fmt.Errorf("failed to get values-file flag: %v", err)
+			}
+
 			var selectedPath string
 			if valuePath != "" {
 				selectedPath = valuePath
@@ -114,7 +119,7 @@ func New() *cobra.Command {
 
 			// Render original template
 			slog.Info("Rendering original template...")
-			originalManifest, err := client.RenderTemplate(chartPath, chartName)
+			originalManifest, err := client.RenderTemplate(chartPath, chartName, valuesFile)
 			if err != nil {
 				return fmt.Errorf("failed to render original template: %v", err)
 			}
@@ -123,7 +128,7 @@ func New() *cobra.Command {
 
 			// Render template with modified value
 			slog.Info("Rendering template with modified value...")
-			modifiedManifest, err := client.RenderTemplateWithModifiedValue(chartPath, chartName, selectedPath)
+			modifiedManifest, err := client.RenderTemplateWithModifiedValue(chartPath, chartName, selectedPath, valuesFile)
 			if err != nil {
 				return fmt.Errorf("failed to render template with modified value: %v", err)
 			}
@@ -135,7 +140,12 @@ func New() *cobra.Command {
 			groupedDiffs := yamldiff.CompareYAMLGroupedDetailed(originalManifest, modifiedManifest)
 
 			if len(groupedDiffs) == 0 {
-				fmt.Println("No differences found in the rendered manifests.")
+				fmt.Printf("No differences found in the rendered manifests for path '%s'.\n", selectedPath)
+				fmt.Println("This suggests that the selected value path may not affect the template rendering.")
+				fmt.Println("The value might be:")
+				fmt.Println("  - Used only in specific conditions that are not met")
+				fmt.Println("  - A configuration option that doesn't impact manifest generation")
+				fmt.Println("  - An unused or deprecated field in the chart")
 				return nil
 			}
 
@@ -162,6 +172,7 @@ func New() *cobra.Command {
 	c.Flags().String("chart-url", "", "URL of the Helm chart")
 	c.Flags().String("chart-version", "", "Version of the Helm chart")
 	c.Flags().String("value-path", "", "Specific value path to search for (skips interactive selection)")
+	c.Flags().String("values-file", "", "Path to custom values.yaml file to merge with chart defaults")
 	c.Flags().String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	// Add cache subcommand
